@@ -1,1 +1,350 @@
 
+
+"""
+Monte Carlo Options Pricer
+==========================
+European Call & Put pricing via Geometric Brownian Motion simulation,
+with Black-Scholes analytical comparison and Greeks.
+
+Requirements:
+    pip install numpy matplotlib scipy ipywidgets
+
+Run in Jupyter:
+    jupyter notebook  (then open this .py or copy into a cell)
+
+Run as a standalone script (no widgets, single static plot):
+    python monte_carlo_options.py
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.widgets import Slider, Button, RadioButtons
+from scipy.stats import norm
+
+
+#  Core math
+# ─────────────────────────────────────────────
+
+def bs_price(S, K, T, r, sigma):
+    """Black-Scholes analytical prices + Greeks for European options."""
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    call = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    put  = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+    delta  = norm.cdf(d1)
+    gamma  = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+    theta  = (-(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T))
+              - r * K * np.exp(-r * T) * norm.cdf(d2)) / 365
+    vega   = S * norm.pdf(d1) * np.sqrt(T) * 0.01
+    rho    = K * T * np.exp(-r * T) * norm.cdf(d2) * 0.01
+    return dict(call=call, put=put, d1=d1, d2=d2,
+                delta=delta, gamma=gamma, theta=theta, vega=vega, rho=rho)
+
+
+def monte_carlo(S, K, T, r, sigma, n_sims=10_000, n_steps=52, n_paths_plot=20):
+    """
+    Simulate n_sims GBM paths with n_steps weekly time steps.
+
+    Returns
+    -------
+    mc_call, mc_put          : discounted average payoff prices
+    call_ci, put_ci          : 95 % confidence half-widths
+    terminal_prices          : array of S_T values  (n_sims,)
+    sample_paths             : array of price paths  (n_paths_plot, n_steps+1)
+    """
+    dt       = T / n_steps
+    discount = np.exp(-r * T)
+
+    # ── Simulate all paths at once ──────────────────────────────────────
+    # shape: (n_sims, n_steps)
+    Z      = np.random.standard_normal((n_sims, n_steps))
+    drift  = (r - 0.5 * sigma**2) * dt
+    diff   = sigma * np.sqrt(dt) * Z
+    # Cumulative log-return, then spot
+    log_returns   = np.cumsum(drift + diff, axis=1)           # (n_sims, n_steps)
+    path_prices   = S * np.exp(log_returns)                   # (n_sims, n_steps)
+    full_paths    = np.hstack([np.full((n_sims, 1), S), path_prices])  # include S_0
+
+    terminal = full_paths[:, -1]
+
+    # ── Payoffs ─────────────────────────────────────────────────────────
+    call_payoffs = np.maximum(terminal - K, 0)
+    put_payoffs  = np.maximum(K - terminal, 0)
+
+    mc_call = discount * call_payoffs.mean()
+    mc_put  = discount * put_payoffs.mean()
+
+    call_ci = 1.96 * discount * call_payoffs.std(ddof=1) / np.sqrt(n_sims)
+    put_ci  = 1.96 * discount * put_payoffs.std(ddof=1)  / np.sqrt(n_sims)
+
+    sample_paths = full_paths[:n_paths_plot, :]
+
+    return mc_call, mc_put, call_ci, put_ci, terminal, sample_paths
+
+
+#  Plot builder
+# ─────────────────────────────────────────────
+
+BLUE   = "#378ADD"
+PINK   = "#D4537E"
+RED    = "#E24B4A"
+GRAY   = "#888780"
+GREEN  = "#639922"
+AMBER  = "#BA7517"
+
+def build_figure():
+    fig = plt.figure(figsize=(16, 10), facecolor="#F8F8F6")
+    fig.suptitle("Monte Carlo Options Pricer  —  European Call & Put",
+                 fontsize=14, fontweight="bold", y=0.98)
+    return fig
+
+
+def draw_all(ax_paths, ax_dist, ax_greeks, ax_metrics,
+             S, K, T, r, sigma, n_sims, opt_type):
+    for ax in [ax_paths, ax_dist, ax_greeks, ax_metrics]:
+        ax.cla()
+
+    mc_call, mc_put, call_ci, put_ci, terminal, sample_paths = monte_carlo(
+        S, K, T, r, sigma, n_sims=n_sims
+    )
+    bs = bs_price(S, K, T, r, sigma)
+    time_axis = np.linspace(0, T, sample_paths.shape[1])
+
+    # ── 1. Sample price paths ────────────────────────────────────────────
+    for i, path in enumerate(sample_paths):
+        color = BLUE if i == 0 else f"#{200:02x}{200:02x}{200:02x}"
+        lw    = 1.4 if i == 0 else 0.6
+        alpha = 1.0 if i == 0 else 0.45
+        ax_paths.plot(time_axis, path, color=color, lw=lw, alpha=alpha)
+
+    ax_paths.axhline(K, color=RED, lw=1.2, ls="--", label=f"Strike K={K}")
+    ax_paths.set_title("Sample price paths (20 shown)", fontsize=10)
+    ax_paths.set_xlabel("Time (years)", fontsize=9)
+    ax_paths.set_ylabel("Price ($)", fontsize=9)
+    ax_paths.legend(fontsize=8)
+    ax_paths.set_facecolor("#FAFAF8")
+    ax_paths.tick_params(labelsize=8)
+
+    # ── 2. Terminal price distribution ──────────────────────────────────
+    bins = np.linspace(terminal.min(), terminal.max(), 45)
+    itm_mask = terminal >= K
+
+    ax_dist.hist(terminal[~itm_mask], bins=bins, color=PINK,  alpha=0.85, label="OTM")
+    ax_dist.hist(terminal[itm_mask],  bins=bins, color=BLUE,  alpha=0.85, label="ITM")
+    ax_dist.axvline(K, color=RED, lw=1.4, ls="--", label=f"Strike ${K}")
+    ax_dist.axvline(terminal.mean(), color=AMBER, lw=1.2, ls=":",
+                    label=f"Mean ${terminal.mean():.1f}")
+    ax_dist.set_title("Terminal price distribution", fontsize=10)
+    ax_dist.set_xlabel("S_T ($)", fontsize=9)
+    ax_dist.set_ylabel("Count", fontsize=9)
+    ax_dist.legend(fontsize=8)
+    ax_dist.set_facecolor("#FAFAF8")
+    ax_dist.tick_params(labelsize=8)
+
+    # ── 3. Metrics table ─────────────────────────────────────────────────
+    ax_metrics.axis("off")
+    col_labels = ["", "MC Price", "BS Price", "Difference", "95% CI"]
+
+    def pct_diff(mc, bs_v):
+        return f"{(mc - bs_v) / bs_v * 100:+.2f}%"
+
+    rows = [
+        ["Call", f"${mc_call:.4f}", f"${bs['call']:.4f}",
+         pct_diff(mc_call, bs['call']), f"±${call_ci:.4f}"],
+        ["Put",  f"${mc_put:.4f}",  f"${bs['put']:.4f}",
+         pct_diff(mc_put,  bs['put']),  f"±${put_ci:.4f}"],
+    ]
+    row_colors = [["#E6F1FB"] * 5, ["#FBEAF0"] * 5]
+    tbl = ax_metrics.table(
+        cellText=rows, colLabels=col_labels,
+        cellLoc="center", loc="center",
+        cellColours=row_colors,
+        bbox=[0, 0.35, 1, 0.6]
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    for (r_idx, c_idx), cell in tbl.get_celld().items():
+        cell.set_edgecolor("#CCCCCC")
+        if r_idx == 0:
+            cell.set_facecolor("#E8E8E4")
+            cell.set_text_props(fontweight="bold")
+
+    ax_metrics.set_title("Pricing summary", fontsize=10, pad=4)
+
+    # ── 4. Greeks bar chart ──────────────────────────────────────────────
+    greek_names  = ["Delta", "Gamma", "Theta\n($/day)", "Vega\n(per 1%σ)", "Rho\n(per 1%r)"]
+    greek_values = [bs["delta"], bs["gamma"], bs["theta"], bs["vega"], bs["rho"]]
+    bar_colors   = [BLUE if v >= 0 else RED for v in greek_values]
+
+    bars = ax_greeks.bar(greek_names, greek_values, color=bar_colors, alpha=0.85,
+                         edgecolor="white", linewidth=0.5)
+    for bar, val in zip(bars, greek_values):
+        ax_greeks.text(bar.get_x() + bar.get_width() / 2,
+                       bar.get_height() + (0.001 if val >= 0 else -0.001),
+                       f"{val:.4f}", ha="center", va="bottom" if val >= 0 else "top",
+                       fontsize=8)
+    ax_greeks.axhline(0, color=GRAY, lw=0.8)
+    ax_greeks.set_title("Black-Scholes Greeks (call)", fontsize=10)
+    ax_greeks.set_facecolor("#FAFAF8")
+    ax_greeks.tick_params(labelsize=8)
+
+    plt.draw()
+
+
+#  Interactive matplotlib figure
+# ─────────────────────────────────────────────
+
+def run_interactive():
+    fig = build_figure()
+
+    # ── Layout ──────────────────────────────────────────────────────────
+    gs = gridspec.GridSpec(
+        3, 2,
+        figure=fig,
+        top=0.93, bottom=0.32,
+        hspace=0.45, wspace=0.35
+    )
+    ax_paths   = fig.add_subplot(gs[0:2, 0])
+    ax_dist    = fig.add_subplot(gs[0:2, 1])
+    ax_metrics = fig.add_subplot(gs[2, 0])
+    ax_greeks  = fig.add_subplot(gs[2, 1])
+
+    # ── Slider axes ─────────────────────────────────────────────────────
+    slider_specs = [
+        # (label,      left,  bot,   width, min,   max,   valinit, valfmt)
+        ("Spot S ($)", 0.08,  0.26,  0.35,  50,    200,   100,    "%.0f"),
+        ("Strike K ($)",0.08, 0.22,  0.35,  50,    200,   105,    "%.0f"),
+        ("Volatility σ (%)", 0.08, 0.18, 0.35, 5,  80,    20,     "%.0f"),
+        ("Rate r (%)",  0.08, 0.14,  0.35,  0,     15,    4.5,    "%.1f"),
+        ("Expiry T (yr)",0.08,0.10,  0.35,  0.05,  2,     0.5,    "%.2f"),
+    ]
+
+    sliders = []
+    for label, l, b, w, mn, mx, v0, fmt in slider_specs:
+        ax_s = fig.add_axes([l, b, w, 0.025], facecolor="#EFEFEC")
+        sl   = Slider(ax_s, label, mn, mx, valinit=v0, valfmt=fmt,
+                      color=BLUE, track_color="#DCDCD8")
+        sl.label.set_fontsize(8)
+        sl.valtext.set_fontsize(8)
+        sliders.append(sl)
+
+    s_S, s_K, s_vol, s_r, s_T = sliders
+
+    # ── Sim-size radio ────────────────────────────────────────────────────
+    ax_radio = fig.add_axes([0.56, 0.08, 0.12, 0.18], facecolor="#F0F0EC")
+    radio = RadioButtons(ax_radio, ("1 000", "10 000", "50 000"),
+                         active=1, activecolor=BLUE)
+    ax_radio.set_title("Simulations", fontsize=8, pad=2)
+    for lbl in radio.labels:
+        lbl.set_fontsize(8)
+
+    sim_map = {"1 000": 1_000, "10 000": 10_000, "50 000": 50_000}
+
+    # ── Run button ────────────────────────────────────────────────────────
+    ax_btn = fig.add_axes([0.72, 0.10, 0.14, 0.05])
+    btn    = Button(ax_btn, "Run simulation", color="#E8E8E4", hovercolor="#D0D0CC")
+    btn.label.set_fontsize(9)
+
+    # ── Opt-type radio ────────────────────────────────────────────────────
+    ax_type = fig.add_axes([0.87, 0.08, 0.10, 0.18], facecolor="#F0F0EC")
+    type_radio = RadioButtons(ax_type, ("Call", "Put", "Both"), active=0, activecolor=BLUE)
+    ax_type.set_title("Type", fontsize=8, pad=2)
+    for lbl in type_radio.labels:
+        lbl.set_fontsize(8)
+
+    # ── Initial draw ──────────────────────────────────────────────────────
+    draw_all(ax_paths, ax_dist, ax_greeks, ax_metrics,
+             S=100, K=105, T=0.5, r=0.045, sigma=0.20,
+             n_sims=10_000, opt_type="Call")
+
+    def on_run(_event):
+        S     = s_S.val
+        K     = s_K.val
+        sigma = s_vol.val / 100
+        r     = s_r.val   / 100
+        T     = s_T.val
+        n_sims = sim_map[radio.value_selected]
+        otype  = type_radio.value_selected
+        draw_all(ax_paths, ax_dist, ax_greeks, ax_metrics,
+                 S, K, T, r, sigma, n_sims, otype)
+
+    btn.on_clicked(on_run)
+
+    plt.show()
+
+
+#  Jupyter / ipywidgets version
+# ─────────────────────────────────────────────
+
+def run_jupyter():
+    try:
+        import ipywidgets as widgets
+        from IPython.display import display
+    except ImportError:
+        print("ipywidgets not installed — falling back to matplotlib interactive mode.")
+        run_interactive()
+        return
+
+    out = widgets.Output()
+
+    style  = {"description_width": "160px"}
+    layout = widgets.Layout(width="420px")
+
+    w_S     = widgets.FloatSlider(value=100,  min=50,   max=200,  step=1,    description="Spot S ($)",      style=style, layout=layout)
+    w_K     = widgets.FloatSlider(value=105,  min=50,   max=200,  step=1,    description="Strike K ($)",    style=style, layout=layout)
+    w_vol   = widgets.FloatSlider(value=20,   min=5,    max=80,   step=0.5,  description="Volatility σ (%)",style=style, layout=layout)
+    w_r     = widgets.FloatSlider(value=4.5,  min=0,    max=15,   step=0.25, description="Rate r (%)",      style=style, layout=layout)
+    w_T     = widgets.FloatSlider(value=0.5,  min=0.05, max=2,    step=0.05, description="Expiry T (yr)",   style=style, layout=layout)
+    w_sims  = widgets.RadioButtons(options=["1 000","10 000","50 000"], value="10 000",
+                                   description="Simulations:", style=style)
+    w_type  = widgets.RadioButtons(options=["Call","Put","Both"], value="Call",
+                                   description="Option type:", style=style)
+    w_btn   = widgets.Button(description="Run simulation",
+                             button_style="primary", layout=widgets.Layout(width="160px"))
+
+    display(widgets.VBox([
+        widgets.HBox([
+            widgets.VBox([w_S, w_K, w_vol, w_r, w_T]),
+            widgets.VBox([w_sims, w_type, w_btn])
+        ]),
+        out
+    ]))
+
+    sim_map = {"1 000": 1_000, "10 000": 10_000, "50 000": 50_000}
+
+    def on_run(_btn):
+        with out:
+            out.clear_output(wait=True)
+            fig = build_figure()
+            gs  = gridspec.GridSpec(3, 2, figure=fig, top=0.93, bottom=0.04,
+                                    hspace=0.45, wspace=0.35)
+            ax_paths   = fig.add_subplot(gs[0:2, 0])
+            ax_dist    = fig.add_subplot(gs[0:2, 1])
+            ax_metrics = fig.add_subplot(gs[2, 0])
+            ax_greeks  = fig.add_subplot(gs[2, 1])
+            draw_all(ax_paths, ax_dist, ax_greeks, ax_metrics,
+                     S=w_S.val, K=w_K.val,
+                     T=w_T.val, r=w_r.val / 100,
+                     sigma=w_vol.val / 100,
+                     n_sims=sim_map[w_sims.value],
+                     opt_type=w_type.value)
+            plt.show()
+
+    w_btn.on_click(on_run)
+    on_run(None)
+
+
+#  Entry point
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # Detect Jupyter
+    try:
+        shell = get_ipython().__class__.__name__   # type: ignore
+        if shell in ("ZMQInteractiveShell",):
+            run_jupyter()
+        else:
+            run_interactive()
+    except NameError:
+        run_interactive()
